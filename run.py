@@ -14,7 +14,8 @@ BILI_COOKIE_FILE = 'bili_cookie.json'
 NETEASE_CONFIG_FILE = 'playlist_config.json'
 PLAYLIST_FILE = 'playlist.json'
 FAIL_LOG_FILE = 'fail.json'
-SEARCH_SLEEP_SECONDS = 3 # 新增：每次搜索操作之间的延时秒数
+SEARCH_SLEEP_SECONDS = 3
+RETRY_SLEEP_MINUTES = 5 # 新增：风控后重试的暂停分钟数
 
 # --- Part 1: 网易云歌单解析 (无需改动) ---
 def parse_netease_playlist():
@@ -87,9 +88,13 @@ def get_bilibili_credential():
     return cookies
 
 async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
+    """
+    执行一轮收藏任务。
+    如果成功，返回空的列表。
+    如果遇到风控(412)，返回剩余的歌曲列表。
+    """
     if not songs:
-        print("歌曲列表为空。")
-        return
+        return []
     
     try:
         credential = Credential(sessdata=cookies['SESSDATA'], bili_jct=cookies['bili_jct'])
@@ -106,29 +111,33 @@ async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
 
     except Exception as e:
         print(f"\nB站操作失败（可能是创建收藏夹时出错）: {e}")
-        print("请检查B站cookie是否正确或已过期。")
-        with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(songs, f, ensure_ascii=False, indent=2)
-        print(f"\n已将全部 {len(songs)} 首待处理歌曲保存到 {FAIL_LOG_FILE}")
-        return
+        # 检查是否是风控错误
+        if "状态码：412" in str(e):
+            print("创建收藏夹时遭遇风控。")
+            with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f: json.dump(songs, f, ensure_ascii=False, indent=2)
+            return songs # 返回整个列表以进行重试
+        else:
+            print("这是一个未知错误，程序将终止。")
+            # 对于未知错误，我们还是保存一下进度
+            with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f: json.dump(songs, f, ensure_ascii=False, indent=2)
+            return None # 返回None表示不可恢复的错误
 
     total = len(original_songs)
     start_offset = total - len(songs)
 
-    try:
-        for i, song in enumerate(songs):
+    individually_failed_songs = []
+
+    for i, song in enumerate(songs):
+        try:
             current_index = i + start_offset
             keyword = f"{song['name']} {song['artist']}"
             print(f"--- [{current_index + 1}/{total}] 正在处理: {keyword} ---")
-
             search_result = await search.search_by_type(keyword, search_type=search.SearchObjectType.VIDEO)
             videos = search_result.get('result', [])
-            
             if not videos:
                 print("未找到相关视频，跳过。")
-                time.sleep(SEARCH_SLEEP_SECONDS) # 即使没找到也延时
+                individually_failed_songs.append(song)
                 continue
-
             found_video = False
             for video_info in videos:
                 duration_str = video_info.get('duration', '0:0')
@@ -136,44 +145,48 @@ async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
                     parts = list(map(int, duration_str.split(':')))
                     total_seconds = sum(part * 60**i for i, part in enumerate(reversed(parts)))
                 except (ValueError, TypeError): total_seconds = 0
-                
                 if 60 < total_seconds < 600 and 'bvid' in video_info:
                     bvid = video_info['bvid']
                     title = video_info.get('title', '').replace('<em class="keyword">', '').replace('</em>', '')
                     print(f"找到合适视频: {title} (BVID: {bvid}, 时长: {duration_str})")
-                    
                     v = video.Video(bvid=bvid, credential=credential)
                     await v.set_favorite(add_media_ids=[folder_id])
-                    
                     print(f"收藏成功！")
                     found_video = True
                     break
-
             if not found_video: 
                 print('搜索结果中未找到时长合适的视频，跳过此歌曲。')
-
-            # ##################################################
-            # ###          关键改动：增加搜索延时           ###
-            # ##################################################
+                individually_failed_songs.append(song)
             print(f"暂停 {SEARCH_SLEEP_SECONDS} 秒...")
             time.sleep(SEARCH_SLEEP_SECONDS)
-            # ##################################################
         
-        print("\n--- 全部任务成功完成！ ---")
+        except Exception as e:
+            print(f"\n\n在处理歌曲 '{keyword}' 时发生严重错误！")
+            print(f"错误详情: {e}")
+            # 检查是否是风控错误
+            if "状态码：412" in str(e):
+                remaining_songs = songs[i:]
+                with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(remaining_songs, f, ensure_ascii=False, indent=2)
+                print(f"检测到B站风控，已将剩余的 {len(remaining_songs)} 首歌曲保存到 {FAIL_LOG_FILE}")
+                return remaining_songs # 返回剩余列表，触发重试
+            else:
+                # 其他错误，只记录当前失败的这首歌，然后继续尝试下一首
+                print("此错误非风控，将记录本首歌曲并继续...")
+                individually_failed_songs.append(song)
+
+    # 如果循环正常结束，将那些只是没找到视频的歌曲写入fail.json
+    if individually_failed_songs:
+        with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(individually_failed_songs, f, ensure_ascii=False, indent=2)
+        print(f"\n本轮任务完成！有 {len(individually_failed_songs)} 首歌曲因未找到视频而失败，已记录到 {FAIL_LOG_FILE}")
+    else:
+        # 仅当所有歌曲都成功时，才清空fail.json
         if os.path.exists(FAIL_LOG_FILE):
             os.remove(FAIL_LOG_FILE)
+        print("\n--- 本轮全部任务成功完成！ ---")
 
-    except Exception as e:
-        print(f"\n\n在处理歌曲 '{keyword}' 时发生严重错误，疑似B站风控！")
-        print(f"错误详情: {e}")
-        
-        remaining_songs = songs[i:]
-        if remaining_songs:
-            with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(remaining_songs, f, ensure_ascii=False, indent=2)
-            print(f"已将剩余的 {len(remaining_songs)} 首歌曲保存到 {FAIL_LOG_FILE} 以便下次继续。")
-        return
-
+    return [] # 返回空列表表示本轮成功
 
 # --- 主程序入口 ---
 async def main():
@@ -186,10 +199,8 @@ async def main():
     except FileNotFoundError:
         fail_file_exists = False
         playlist_file_exists = False
-        
     if playlist_file_exists and fail_file_exists:
         source_choice = input("请选择要处理的歌单: [U]RL歌单(上次缓存) 或 [F]ail.json(上次失败)？ (U/F): ").strip().upper()
-    
     if source_choice == 'F':
         print(f"将从 {FAIL_LOG_FILE} 加载失败列表。")
         with open(FAIL_LOG_FILE, 'r', encoding='utf-8') as f:
@@ -206,13 +217,11 @@ async def main():
         else:
             print("未找到本地缓存歌单，将从网易云获取。")
             songs_to_process = parse_netease_playlist()
-            
     if not songs_to_process:
         print("\n未能获取到任何歌曲，程序退出。")
         return
 
     print(f"\n当前歌单总共有 {len(songs_to_process)} 首歌曲。")
-    
     start_index = 0
     start_choice = input("是否要从特定歌曲开始？(y/n): ").strip().lower()
     if start_choice == 'y':
@@ -222,7 +231,6 @@ async def main():
                 start_index = 0
                 print("将从头开始处理。")
                 break
-            
             found_index = -1
             for i, song in enumerate(songs_to_process):
                 if start_name.lower() in song['name'].lower():
@@ -230,18 +238,40 @@ async def main():
                     full_name = f"{song['name']} - {song['artist']}"
                     print(f"找到歌曲: [{i+1}] {full_name}，将从此首歌曲开始。")
                     break
-            
             if found_index != -1:
                 start_index = found_index
                 break
             else:
                 print("未在歌单中找到包含该名称的歌曲，请重新输入。")
-
-    songs_to_collect = songs_to_process[start_index:]
-    print(f"准备处理 {len(songs_to_collect)} 首歌曲 (从第 {start_index + 1} 首开始)。")
+    songs_to_collect_initial = songs_to_process[start_index:]
+    print(f"准备处理 {len(songs_to_collect_initial)} 首歌曲 (从第 {start_index + 1} 首开始)。")
     
     bili_cookies = get_bilibili_credential()
-    await collect_to_bilibili(songs_to_collect, bili_cookies, songs_to_process)
+    
+    # ##################################################
+    # ###            新增：风控自动重试循环             ###
+    # ##################################################
+    current_song_list = songs_to_collect_initial
+    while True:
+        remaining_songs = await collect_to_bilibili(current_song_list, bili_cookies, songs_to_process)
+        
+        if remaining_songs is None:
+            print("发生不可恢复的错误，程序终止。")
+            break
+        
+        if not remaining_songs:
+            # 返回空列表，说明全部成功
+            print("\n所有歌曲均已成功处理！程序结束。")
+            break
+        else:
+            # 返回非空列表，说明遭遇风控
+            print(f"\nB站风控已触发，脚本将暂停 {RETRY_SLEEP_MINUTES} 分钟后自动重试...")
+            time.sleep(RETRY_SLEEP_MINUTES * 60)
+            print("暂停结束，将从 fail.json 加载剩余任务并继续...")
+            # 更新待处理列表为失败的列表，进入下一次循环
+            with open(FAIL_LOG_FILE, 'r', encoding='utf-8') as f:
+                current_song_list = json.load(f)
+    # ##################################################
 
 if __name__ == '__main__':
     try:
