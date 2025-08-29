@@ -14,6 +14,7 @@ BILI_COOKIE_FILE = 'bili_cookie.json'
 NETEASE_CONFIG_FILE = 'playlist_config.json'
 PLAYLIST_FILE = 'playlist.json'
 FAIL_LOG_FILE = 'fail.json'
+SEARCH_SLEEP_SECONDS = 3 # 新增：每次搜索操作之间的延时秒数
 
 # --- Part 1: 网易云歌单解析 (无需改动) ---
 def parse_netease_playlist():
@@ -119,11 +120,15 @@ async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
             current_index = i + start_offset
             keyword = f"{song['name']} {song['artist']}"
             print(f"--- [{current_index + 1}/{total}] 正在处理: {keyword} ---")
+
             search_result = await search.search_by_type(keyword, search_type=search.SearchObjectType.VIDEO)
             videos = search_result.get('result', [])
+            
             if not videos:
                 print("未找到相关视频，跳过。")
+                time.sleep(SEARCH_SLEEP_SECONDS) # 即使没找到也延时
                 continue
+
             found_video = False
             for video_info in videos:
                 duration_str = video_info.get('duration', '0:0')
@@ -131,17 +136,28 @@ async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
                     parts = list(map(int, duration_str.split(':')))
                     total_seconds = sum(part * 60**i for i, part in enumerate(reversed(parts)))
                 except (ValueError, TypeError): total_seconds = 0
+                
                 if 60 < total_seconds < 600 and 'bvid' in video_info:
                     bvid = video_info['bvid']
                     title = video_info.get('title', '').replace('<em class="keyword">', '').replace('</em>', '')
                     print(f"找到合适视频: {title} (BVID: {bvid}, 时长: {duration_str})")
+                    
                     v = video.Video(bvid=bvid, credential=credential)
                     await v.set_favorite(add_media_ids=[folder_id])
+                    
                     print(f"收藏成功！")
                     found_video = True
                     break
+
             if not found_video: 
                 print('搜索结果中未找到时长合适的视频，跳过此歌曲。')
+
+            # ##################################################
+            # ###          关键改动：增加搜索延时           ###
+            # ##################################################
+            print(f"暂停 {SEARCH_SLEEP_SECONDS} 秒...")
+            time.sleep(SEARCH_SLEEP_SECONDS)
+            # ##################################################
         
         print("\n--- 全部任务成功完成！ ---")
         if os.path.exists(FAIL_LOG_FILE):
@@ -150,12 +166,14 @@ async def collect_to_bilibili(songs: list, cookies: dict, original_songs: list):
     except Exception as e:
         print(f"\n\n在处理歌曲 '{keyword}' 时发生严重错误，疑似B站风控！")
         print(f"错误详情: {e}")
+        
         remaining_songs = songs[i:]
         if remaining_songs:
             with open(FAIL_LOG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(remaining_songs, f, ensure_ascii=False, indent=2)
             print(f"已将剩余的 {len(remaining_songs)} 首歌曲保存到 {FAIL_LOG_FILE} 以便下次继续。")
         return
+
 
 # --- 主程序入口 ---
 async def main():
@@ -195,15 +213,12 @@ async def main():
 
     print(f"\n当前歌单总共有 {len(songs_to_process)} 首歌曲。")
     
-    # ##################################################
-    # ###          断点续传逻辑 (已修正为名称搜索)       ###
-    # ##################################################
     start_index = 0
     start_choice = input("是否要从特定歌曲开始？(y/n): ").strip().lower()
     if start_choice == 'y':
         while True:
             start_name = input("请输入要开始的歌曲名 (输入部分名称即可, 直接回车则从头开始): ").strip()
-            if not start_name: # 用户直接回车，从头开始
+            if not start_name:
                 start_index = 0
                 print("将从头开始处理。")
                 break
@@ -221,7 +236,6 @@ async def main():
                 break
             else:
                 print("未在歌单中找到包含该名称的歌曲，请重新输入。")
-    # ##################################################
 
     songs_to_collect = songs_to_process[start_index:]
     print(f"准备处理 {len(songs_to_collect)} 首歌曲 (从第 {start_index + 1} 首开始)。")
